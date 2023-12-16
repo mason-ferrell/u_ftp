@@ -1,0 +1,221 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <dirent.h>
+#include <sys/time.h>
+
+#define BUFSIZE 65536
+
+//error wrapper for syscalls
+void error(char *msg) {
+	fprintf(stderr, "Fatal error %s\n", msg);
+	exit(-1);
+}
+
+//struct to bundle socket info together, make function calls less tedious
+typedef struct {
+	struct sockaddr_in clientaddr;
+	struct hostent *hostp;
+	char *hostaddrp;
+	int clientlen;
+} clientinfo;
+
+//make life a little bit easier
+void uftp_sendto(int sockfd, char *buf, int bufsize, clientinfo *c) {
+	if(sendto(sockfd, buf, bufsize, 0, (struct sockaddr*)&c->clientaddr, c->clientlen) < 0)
+		error("sending data to server");
+}
+
+void uftp_recvfrom(int sockfd, char *buf, clientinfo *c) {
+	if(recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr*)&c->clientaddr, &c->clientlen) < 0)
+		error("receiving data from server");
+}
+
+//prototypes for put, get, and ls functionality
+void put(char*, char*, int, clientinfo*);
+void get(char*, char*, int, clientinfo*);
+void ls(char*, int, clientinfo*);
+
+//this function is used in put and get
+int get_file_size(FILE*);
+
+int main(int argc, char **argv) {
+	int sockfd;
+	int optval;
+	struct sockaddr_in serveraddr;
+	clientinfo c;
+	char buf[BUFSIZE];
+	char *command, *filename, parsetmp[BUFSIZE];
+	struct timeval timeout;
+	
+	if(argc != 2) {
+		printf("Usage: %s <port number>\n", argv[0]);
+		exit(-1);
+	}
+	
+	//open socket
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if(sockfd < 0) error("opening socket");
+	
+	optval = 1;
+	if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const void *) &optval, sizeof(int)) < 0)
+		error("setting reuseaddr");
+	
+	//setting up server address info
+	bzero((char *) &serveraddr, sizeof(serveraddr));
+	serveraddr.sin_family = AF_INET;
+	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serveraddr.sin_port = htons(atoi(argv[1]));
+	
+	if(bind(sockfd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) error("binding socket");
+	
+	c.clientlen = sizeof(c.clientaddr);
+	while(1) {
+		//receive command from client, populate client information
+		bzero(buf, BUFSIZE);
+		uftp_recvfrom(sockfd, buf, &c);
+		
+		c.hostp = gethostbyaddr((const char *)&c.clientaddr.sin_addr.s_addr,
+					sizeof(c.clientaddr.sin_addr.s_addr), AF_INET);
+		
+		if(c.hostp == NULL) error("in gethostbyaddr");
+		c.hostaddrp = inet_ntoa(c.clientaddr.sin_addr);
+		if(c.hostaddrp == NULL) error("in inet_ntoa");
+		
+		//parse command and filename
+		//WORK ON THIS, CHECK THAT INPUT IS VALID
+		strcpy(parsetmp, buf);
+		
+		command = strtok(parsetmp, " ");
+		filename = strtok(NULL, "\n");
+		
+		bzero(buf, BUFSIZE);
+		
+		if(strcmp(command, "put")==0) {
+			put(filename, buf, sockfd, &c);
+		}
+		
+		else if(strcmp(command, "get")==0) {
+			get(filename, buf, sockfd, &c);
+		}
+		
+		else if(strcmp(command, "ls")==0 || strcmp(command, "ls\n")==0) {
+			ls(buf, sockfd, &c);
+		}
+		
+		else if(strcmp(command, "delete")==0) {
+			if(strcmp(filename, "server")==0) continue;
+			if(remove(filename)!=0) continue;
+		}
+		
+		else if(strcmp(command, "exit")==0 || strcmp(command, "exit\n")==0) {
+			strcpy(buf, "Goodbye!");
+			uftp_sendto(sockfd, buf, strlen(buf), &c);
+		}
+	}
+}
+
+void put(char *filename, char *buf, int sockfd, clientinfo *c) {
+	FILE *fp;
+	int filesize;
+	
+	if(strcmp(filename, "server")==0) {
+		return;
+	}
+	
+	uftp_recvfrom(sockfd, (char*)&filesize, c);
+	if(filesize==-1) {
+		return;
+	}
+	
+	fp = fopen(filename, "wb");
+	if(fp == NULL) error("opening file for put");
+	
+	uftp_sendto(sockfd, "ACK", strlen("ACK"), c);
+	
+	uftp_recvfrom(sockfd, buf, c);
+	
+	if(fwrite(buf, 1, filesize, fp) < filesize) {
+		fprintf(stderr, "Couldn't write full contents of file\n");
+	}
+	
+	if(fclose(fp) != 0) error("closing file");
+}
+
+void get(char *filename, char *buf, int sockfd, clientinfo *c) {
+	FILE *fp;
+	int filesize = -1;
+	
+	if(strcmp(filename, "server")==0) return;
+	
+	fp = fopen(filename, "r");
+	if(fp == NULL) {
+		printf("Error opening file, please check it exists\n");
+		uftp_sendto(sockfd, (char *) &filesize, sizeof(int), c);
+		return;
+	}
+	
+	filesize = get_file_size(fp);
+	if(filesize > BUFSIZE) {
+		printf("File too large to transfer\n");
+		uftp_sendto(sockfd, (char*)&filesize, sizeof(int), c);
+		return;
+	}
+	
+	uftp_sendto(sockfd, (char*)&filesize, sizeof(int), c);
+	
+	uftp_recvfrom(sockfd, buf, c);
+	if(strcmp(buf, "ACK")!=0) {
+		fprintf(stderr, "Couldn't receive ACK\n");
+		return;
+	}
+	
+	bzero(buf, BUFSIZE);
+
+	if(fread(buf, 1, filesize, fp) < filesize) {
+		fprintf(stderr, "Error: couldn't read entire file");
+	} else {
+		uftp_sendto(sockfd, buf, filesize, c);
+	}
+	
+	if(fclose(fp) != 0) error("closing file");
+}
+
+void ls(char* buf, int sockfd, clientinfo *c) {
+	struct dirent *d;
+	DIR *dh;
+	char cwd[BUFSIZE];
+	
+	if(getcwd(cwd, sizeof(cwd)) == NULL) error("getting cwd");		
+	dh = opendir(cwd);
+	if(!dh) error("opening directory");
+			
+	strcat(buf, "\n");
+	while((d = readdir(dh)) != NULL) {
+		if(d->d_name[0] == '.') continue;
+		
+		if(strcmp(d->d_name, "server")==0 || strcmp(d->d_name, "server.c")==0)
+			continue;
+				
+		strcat(buf, d->d_name);
+		strcat(buf, "\n");
+	}
+			
+	uftp_sendto(sockfd, buf, strlen(buf), c);
+}
+
+int get_file_size(FILE *fp) {
+	int size;
+	
+	fseek(fp, 0, SEEK_END);
+	size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	
+	return size;
+}
